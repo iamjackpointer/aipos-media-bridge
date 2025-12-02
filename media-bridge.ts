@@ -6,7 +6,7 @@ serve(async (req: Request) => {
   const url = new URL(req.url);
   const upgradeHeader = req.headers.get("upgrade") || "";
 
-  // CRITICAL: Handle WebSocket upgrades FIRST, before health checks
+  // Handle WebSocket upgrade FIRST (before health check)
   if (upgradeHeader.toLowerCase() === "websocket") {
     // Extract parameters from URL
     const agentId = url.searchParams.get("agent_id");
@@ -14,29 +14,25 @@ serve(async (req: Request) => {
     const phoneNumber = url.searchParams.get("phone_number") || "";
     const callSid = url.searchParams.get("call_sid") || "";
 
-    console.log(`[${callSid}] WebSocket upgrade request received`);
-
     if (!agentId) {
-      console.error(`[${callSid}] Missing agent_id`);
       return new Response("Missing agent_id", { status: 400 });
     }
 
     if (!ELEVENLABS_API_KEY) {
-      console.error(`[${callSid}] ELEVENLABS_API_KEY not configured`);
+      console.error("ELEVENLABS_API_KEY not configured");
       return new Response("Server configuration error", { status: 500 });
     }
 
-    // Upgrade to WebSocket IMMEDIATELY (no async operations before this!)
+    // Upgrade to WebSocket
     const { socket: twilioSocket, response } = Deno.upgradeWebSocket(req);
-
+    
     let elevenlabsSocket: WebSocket | null = null;
     let streamSid: string | null = null;
     let elevenlabsReady = false;
-    const audioBuffer: Uint8Array[] = [];
 
     twilioSocket.onopen = async () => {
       console.log(`[${callSid}] Twilio WebSocket connected`);
-
+      
       try {
         // Get signed URL from ElevenLabs
         const response = await fetch(
@@ -51,23 +47,23 @@ serve(async (req: Request) => {
 
         if (!response.ok) {
           const errorText = await response.text();
-          console.error(`[${callSid}] Failed to get signed URL: ${response.status} - ${errorText}`);
+          console.error(`[${callSid}] Failed to get signed URL:`, response.status, errorText);
           twilioSocket.close();
           return;
         }
 
         const data = await response.json();
         const signedUrl = data.signed_url;
-
+        
         console.log(`[${callSid}] Got ElevenLabs signed URL, connecting...`);
-
+        
         // Connect to ElevenLabs
         elevenlabsSocket = new WebSocket(signedUrl);
-
+        
         elevenlabsSocket.onopen = () => {
           console.log(`[${callSid}] ElevenLabs WebSocket connected`);
-
-          // Send initial configuration
+          
+          // Send initial configuration with audio format settings
           const initMessage = {
             type: "conversation_initiation_client_data",
             conversation_config_override: {
@@ -75,47 +71,63 @@ serve(async (req: Request) => {
                 prompt: {
                   prompt: `The caller's business name is ${businessName}. Their phone number is ${phoneNumber}.`
                 },
-                first_message: `Hi ${businessName}! Thanks for calling. How can I help you today?`,
+                first_message: `Hi ${decodeURIComponent(businessName)}! Thanks for calling. How can I help you today?`,
               }
             }
           };
-
+          
           elevenlabsSocket!.send(JSON.stringify(initMessage));
           elevenlabsReady = true;
-          console.log(`[${callSid}] ElevenLabs ready, sent init message`);
-
-          // Send any buffered audio
-          while (audioBuffer.length > 0) {
-            const bufferedAudio = audioBuffer.shift();
-            if (bufferedAudio) {
-              elevenlabsSocket!.send(bufferedAudio);
-            }
-          }
+          console.log(`[${callSid}] Sent init message to ElevenLabs`);
         };
 
         elevenlabsSocket.onmessage = (event) => {
           try {
-            if (event.data instanceof Blob) {
-              // Binary audio data from ElevenLabs
-              event.data.arrayBuffer().then((buffer) => {
-                const audioData = new Uint8Array(buffer);
-                // Convert to base64 for Twilio
-                const base64Audio = btoa(String.fromCharCode(...audioData));
-
-                if (twilioSocket.readyState === WebSocket.OPEN && streamSid) {
+            const message = JSON.parse(event.data);
+            
+            switch (message.type) {
+              case "audio":
+                // Send audio back to Twilio
+                if (streamSid && twilioSocket.readyState === WebSocket.OPEN) {
+                  const audioPayload = message.audio?.chunk || message.audio_event?.audio_base_64;
+                  if (audioPayload) {
+                    twilioSocket.send(JSON.stringify({
+                      event: "media",
+                      streamSid: streamSid,
+                      media: {
+                        payload: audioPayload
+                      }
+                    }));
+                  }
+                }
+                break;
+                
+              case "interruption":
+                // Clear Twilio's audio buffer when user interrupts
+                if (streamSid && twilioSocket.readyState === WebSocket.OPEN) {
                   twilioSocket.send(JSON.stringify({
-                    event: "media",
-                    streamSid: streamSid,
-                    media: {
-                      payload: base64Audio
-                    }
+                    event: "clear",
+                    streamSid: streamSid
                   }));
                 }
-              });
-            } else {
-              // JSON message from ElevenLabs
-              const message = JSON.parse(event.data);
-              console.log(`[${callSid}] ElevenLabs message:`, message.type);
+                break;
+                
+              case "ping":
+                // Respond to ping with pong
+                if (message.ping_event?.event_id) {
+                  elevenlabsSocket!.send(JSON.stringify({
+                    type: "pong",
+                    event_id: message.ping_event.event_id
+                  }));
+                }
+                break;
+                
+              case "conversation_initiation_metadata":
+                console.log(`[${callSid}] Conversation initialized:`, message.conversation_initiation_metadata_event?.conversation_id);
+                break;
+                
+              default:
+                console.log(`[${callSid}] ElevenLabs message:`, message.type);
             }
           } catch (e) {
             console.error(`[${callSid}] Error processing ElevenLabs message:`, e);
@@ -126,8 +138,8 @@ serve(async (req: Request) => {
           console.error(`[${callSid}] ElevenLabs WebSocket error:`, error);
         };
 
-        elevenlabsSocket.onclose = () => {
-          console.log(`[${callSid}] ElevenLabs WebSocket closed`);
+        elevenlabsSocket.onclose = (event) => {
+          console.log(`[${callSid}] ElevenLabs WebSocket closed:`, event.code, event.reason);
           if (twilioSocket.readyState === WebSocket.OPEN) {
             twilioSocket.close();
           }
@@ -142,19 +154,16 @@ serve(async (req: Request) => {
     twilioSocket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
-
+        
         if (message.event === "start") {
           streamSid = message.start.streamSid;
           console.log(`[${callSid}] Twilio stream started: ${streamSid}`);
         } else if (message.event === "media") {
-          // Decode Twilio's base64 mulaw audio
-          const audioData = Uint8Array.from(atob(message.media.payload), c => c.charCodeAt(0));
-
+          // Send audio to ElevenLabs as JSON (not raw binary!)
           if (elevenlabsReady && elevenlabsSocket?.readyState === WebSocket.OPEN) {
-            elevenlabsSocket.send(audioData);
-          } else {
-            // Buffer audio until ElevenLabs is ready
-            audioBuffer.push(audioData);
+            elevenlabsSocket.send(JSON.stringify({
+              user_audio_chunk: message.media.payload  // Keep as base64 string
+            }));
           }
         } else if (message.event === "stop") {
           console.log(`[${callSid}] Twilio stream stopped`);
@@ -181,7 +190,7 @@ serve(async (req: Request) => {
     return response;
   }
 
-  // Health checks - only reached for non-WebSocket requests
+  // Health check for non-WebSocket requests
   if (url.pathname === "/health" || url.pathname === "/") {
     return new Response("OK", { status: 200 });
   }
